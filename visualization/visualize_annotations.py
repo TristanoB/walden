@@ -1,7 +1,7 @@
 from pathlib import Path
 from PIL import Image, ImageDraw
 
-ROOT = ""
+ROOT = "/home/franchesoni/walden/"
 
 def load_image_with_bbox(bbox, center_crop=False):
     """
@@ -207,6 +207,7 @@ import csv
 print('loading cell dataset...')
 with open("cell_dataset.pkl", "rb") as f:
     bboxes = pickle.load(f)["bboxes"]
+    print('shape de bboxes', bboxes.shape)
 
 print('loading annotation file...')
 annotation_file = "annotations_lymphoplasmocyte.csv"
@@ -216,6 +217,6 @@ with open(annotation_file, 'r') as f:
     annotations = [(int(row[0]), bool(int(row[1]))) for row in reader]
 # reverse annotations
 annotations = annotations[::-1]
-visualize_annotations(annotations, bboxes, positive_only=True)
+visualize_annotations(annotations, bboxes, positive_only=False)
 
 # this is a tool to visualize positive or all annotations of each class
