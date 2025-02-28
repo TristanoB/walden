@@ -281,7 +281,7 @@ def main(dstdir, bbox_file, dino_size="large", device="cuda"):
         dino = torch.hub.load("facebookresearch/dinov2", "dinov2_vitl14", force_reload=False)  # Example of a bigger model
         dino = dino.to(device)
         dino_dim = 1024  
-    elif dino_size == "large" : 
+    elif dino_size == "giant" : 
         dino = torch.hub.load("facebookresearch/dinov2", "dinov2_vitg14", force_reload=False)  # Example of a bigger model
         dino = dino.to(device)
         dino_dim = 1536  
