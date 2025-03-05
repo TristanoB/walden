@@ -5,77 +5,41 @@ import pickle
 from pathlib import Path
 from PIL import Image
 import fire
-
-print("importing")
 import tqdm
-from pathlib import Path
-import torch
-import numpy as np
-import torchvision.transforms as transforms
+import timm
 import cv2
-from PIL import Image
 import os
 import matplotlib.pyplot as plt
 import h5py
 import csv
 import shutil
+import torch.nn as nn 
+import torch.nn.functional as F
+from urllib.request import urlopen
+from open_clip import create_model_from_pretrained, get_tokenizer # works on open-clip-torch >= 2.31.0, timm >= 1.0.15
 
-import torch
-import numpy as np
-import cv2
-import matplotlib.pyplot as plt
-from PIL import Image
 
 def extract_features_from_bbox(
-    img,
+    image,
     bbox,
-    img_transform,
-    img_size,
-    dino,
+    preprocess,
+    model,
     device,
+    size_img_new,
     i,
-    dino_dim=384,
+    number_of_first_token_removed,
+    patch_size,
+    dim_features,
     vis=True,
 ):
-    """
-    Extract feature vector from the bounding box region in the image using DINO.
-    
-    Args:
-        img768 (PIL.Image): Image containing the bounding box at its center.
-        bbox (tuple): Bounding box coordinates (imgnumber, bbox_row, bbox_col, bbox_height, bbox_width).
-        img_transform (callable): Image transformation pipeline.
-        device (torch.device): Device for computation.
-        dino (torch.nn.Module): Pre-trained DINO model.
-        dino_dim (int): Feature dimension of DINO.
-        vis (bool): Whether to visualize the bounding box.
-
-    Returns:
-        np.ndarray: Extracted feature vector.
-    """
-    if i == 0 : 
-        print("size de image orignale", img.size)
+    # Get the coordinnates of the bouding boxe 
     bbox_row_rel, bbox_col_rel, bbox_bottom_rel, bbox_right_rel = bbox[0], bbox[1], bbox[2], bbox[3]
-    size_img_new = img_size  # il faut un multiple de 14 
-    width, height = img.size
+    width, height = image.size
     left = (width - size_img_new) // 2
     top = (height - size_img_new) // 2
     right = left + size_img_new
     bottom = top + size_img_new
-    img_cropped = img.crop((left, top, right, bottom)) # PIL format, cropped to input size 
-    # --- DINO inference --- 
-    with torch.no_grad(): 
-        input_img = img_transform(img_cropped).reshape(1, 3, size_img_new, size_img_new).to(device) # Format for DINO inference 
-        if i == 0 : 
-            print("size de input image", input_img.shape)
-        feats = dino.forward_features(input_img)["x_norm_patchtokens"]
-        if i == 0 :     
-            print("shape des features extraites par DINO", feats.shape)
-        feats = feats.reshape(
-            1, size_img_new//14, size_img_new//14, dino_dim
-        )
-        if i == 0 : 
-            print("shape des features reshape", feats.shape)
-    features = feats.squeeze(0).cpu().numpy()  # Shape: [size_img_new//14, size_img_new//14, dino_dim]
+    img_cropped = image.crop((left, top, right, bottom))  
     adjusted_bbox_row_rel = bbox_row_rel - top
     adjusted_bbox_col_rel = bbox_col_rel - left
     adjusted_bbox_bottom_rel = bbox_bottom_rel - top
@@ -83,57 +47,29 @@ def extract_features_from_bbox(
     local_bbox = (
         adjusted_bbox_row_rel, adjusted_bbox_col_rel, adjusted_bbox_bottom_rel, adjusted_bbox_right_rel
     )
-    # Create segmentation mask for the bounding box
-    seg_crop = np.zeros((size_img_new, size_img_new), dtype=np.uint8)
-    seg_crop[local_bbox[0]:local_bbox[2], local_bbox[1]:local_bbox[3]] = 1
-    # Downsample the segmentation to match the DINO feature map size
-    seg_downsampled = cv2.resize(
-        (seg_crop * 255).astype(np.uint8), (size_img_new//14, size_img_new//14), interpolation=cv2.INTER_LINEAR
-    )
-    seg_downsampled_bool = seg_downsampled > 127  # Shape: [48, 48]
-    
-    # Compute the average feature within the bounding box
-    masked_features = features[seg_downsampled_bool]
-    if masked_features.size == 0:
-        print(f"Bounding box {bbox} has zero downsampled area, returning zeros...")
-        return np.zeros(dino_dim)
-    
-    avg_feature = masked_features.mean(axis=0)
-    
-    # Visualization
+    cell_image = img_cropped.crop((local_bbox[0], local_bbox[1], local_bbox[3], local_bbox[2]))
+    cell_image = cell_image.resize((size_img_new, size_img_new))
+    if i == 0 : 
+        print("size de img_cropped avant transform",img_cropped.size)
+    # --- DINO inference --- 
+    with torch.no_grad():
+        input_img = preprocess(cell_image).unsqueeze(0).to(device)
+        if i == 0 : 
+            print("size de input image", input_img.shape)
+        ### --- Compute feature map --- 
+        feats = model.encode_image(input_img, normalize=True)
+        if i == 0 :     
+            print("shape des features extraites par le modèle", feats.shape)
+    features = feats.squeeze(0).cpu().numpy()  # Shape:  [dino_dim]
+        
     
     if vis:
-        # Visualize the bounding box on the full image
         plt.figure(figsize=(10, 10))
-        plt.imshow(img_cropped) # Transpose de l'image vers format maplotlib (H,W,C)
-        plt.gca().add_patch(
-            plt.Rectangle(
-                (local_bbox[1], local_bbox[0]),  # Position (x, y)
-                local_bbox[3] - local_bbox[1],  # Largeur = bbox_right - bbox_col (+10 de chaque côté)
-                local_bbox[2] - local_bbox[0],  # Hauteur = bbox_bottom - bbox_row (+10 de chaque côté)
-                edgecolor="red",
-                facecolor="none",
-                lw=2,
-            )
-        )
+        plt.imshow(cell_image)
         plt.axis("off")
         plt.savefig("out")
 
-        # Visualize the cropped cell (just the patch for debugging)
-        img_cell = img_cropped.crop((local_bbox[1], local_bbox[0], local_bbox[3], local_bbox[2]))
-        img_cell.save("out_cells.png")
-
-        # Visualize the segmentation mask applied to the DINO feature map
-        plt.figure(figsize=(10, 10))
-        plt.imshow(seg_downsampled_bool, cmap='gray')
-        plt.title("Downsampled Segmentation Mask")
-        plt.axis("off")
-        plt.savefig("segmentation_mask.png")
-        plt.close()
-
-
-    
-    return avg_feature
+    return features
 
 
 
@@ -235,17 +171,20 @@ def load_image_of_bbox(bbox, center_crop=False):
         # We want to produce a 512x512 crop centered on the bbox center
         bbox_center_row = bbox_row_rel + bbox_height / 2
         bbox_center_col = bbox_col_rel + bbox_width / 2
+
         # Center the BBox in the crop
         # The BBox center should map to the center of the crop (256, 256)
         left = int(bbox_center_col - HALF_CROP)
         upper = int(bbox_center_row - HALF_CROP)
         right = left + CROP_SIZE
         lower = upper + CROP_SIZE
+
         # adjust the bbox coordinates according to the new cropped image 
         adjusted_bbox_row = bbox_row_rel - upper
         adjusted_bbox_col = bbox_col_rel - left
         adjusted_bbox_bottom = bbox_bottom_rel - upper
         adjusted_bbox_right = bbox_right_rel - left
+
         # Ensure we don't go outside the composite image boundaries
         if left < 0:
             right -= left
@@ -271,52 +210,41 @@ def load_image_of_bbox(bbox, center_crop=False):
             )
             cropped_image = padded
 
-        return cropped_image, [int(adjusted_bbox_row), int(adjusted_bbox_col), int(adjusted_bbox_bottom), int(adjusted_bbox_right)]
+        return cropped_image, [int(adjusted_bbox_row), int(adjusted_bbox_col), int(adjusted_bbox_bottom), int(adjusted_bbox_right)] 
     else:
         return composite_image, [bbox_row_rel, bbox_col_rel, bbox_bottom_rel, bbox_right_rel] 
 
 
-def main(dstdir, bbox_file, dino_model="dinov2_vitl14_reg", device="cuda"):
-    """Re-run Dino on bounding boxes extracted from .pkl file and save results as .npy"""
+def main(dstdir, bbox_file, model_name="ViT-L-16-SigLIP2-512", device="cuda"):
+    """Re-run Dino on bounding boxes extracted from file and save results as .npy."""
     # 1. --- Load de DINO --- 
+    dino_models = timm.list_models('*mae*', pretrained=True)
+    print("liste de tous les models dino disponibles sur Timm", dino_models)
     device = torch.device(device if torch.cuda.is_available() else "cpu")
     print("Initializing Dino...")
-    if dino_model == "dinov2_vits14_reg":
-        dino = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14_reg") # Small
-        dino = dino.to(device)
-        dino_dim = 384
-        center_crop = False
-        img_size = 644
-    elif dino_model == "dinov2_vitb14_reg" : 
-        dino = torch.hub.load("facebookresearch/dinov2", "dinov2_vitb14_reg")  # Base
-        dino = dino.to(device)
-        dino_dim = 768  
+    # Load DINO using timm
+    
+    if model_name == "ViT-L-16-SigLIP2-512":
+        model, preprocess = create_model_from_pretrained('hf-hub:timm/ViT-L-16-SigLIP2-512')
+        tokenizer = get_tokenizer('hf-hub:timm/ViT-L-16-SigLIP2-512')
+        model = model.to(device)
+        model = model.eval()
+        dim_features = 384
         center_crop = True
-        img_size = 518
-    elif dino_model == "dinov2_vitl14_reg" : 
-        dino = torch.hub.load("facebookresearch/dinov2", "dinov2_vitl14_reg")  # Large
-        dino = dino.to(device)
-        dino_dim = 1024  
-        center_crop = True
-        img_size = 518
-    elif dino_model == "dinov2_vitg14_reg" : 
-        dino = torch.hub.load("facebookresearch/dinov2", "dinov2_vitg14_reg")  # Giant
-        dino = dino.to(device)
-        dino_dim = 1536   
-        center_crop = True
-        img_size = 518
+        number_of_first_token_removed = 1
+        patch_size = 16
+
+
+
     else:
-        raise ValueError(f"{dino_size} not recognized, should be ['small']")
-    dino.eval()
-    print(f"using {dino_model} as DINO model")
-    print("modèle dino", dino)
-    # 2. --- Image initialization ---
+        raise ValueError(f"{model_name} not recognized, should be ['small']")
+    model.eval()
+    # 2. --- Image initialization ---#    
     img_transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
+        ])
     dstdir = Path(dstdir)
-    output_file = dstdir / f"X_labeled_torch_hub_{dino_model}_input_size_{img_size}.npy"
     X_features = []
     # 3. --- Extraction of features vectors --- 
     bboxes = np.load(bbox_file)
@@ -324,7 +252,12 @@ def main(dstdir, bbox_file, dino_model="dinov2_vitl14_reg", device="cuda"):
     for i, bbox in enumerate(tqdm.tqdm(bboxes, desc="Processing bounding boxes", unit="bbox")):
         # bbox : img_number, x_min, y_min, height, width
         image, bbox_coord = load_image_of_bbox(bbox, center_crop=center_crop)
-        feature_vector = extract_features_from_bbox(image, bbox_coord, img_transform, img_size, dino, device, i, dino_dim=dino_dim)
+        size_img_new = 512
+        #model.set_input_size((size_img_new, size_img_new))
+        if i == 0 : 
+            print("size_img_new", size_img_new)
+            output_file = dstdir / f"X_labeled_{model_name}_input_size_{size_img_new}.npy"
+        feature_vector = extract_features_from_bbox(image, bbox_coord, preprocess, model, device, size_img_new, i, number_of_first_token_removed, patch_size, dim_features)
         # 4. --- Save the feature vectors array to the .npy file ---
         X_features.append(feature_vector)
         X_features_np = np.array(X_features, dtype=np.float32)
