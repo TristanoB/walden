@@ -17,6 +17,7 @@ import torch.nn as nn
 
 def extract_features_from_bbox(
     img,
+    model_type,
     bbox,
     img_transform,
     dino,
@@ -27,6 +28,7 @@ def extract_features_from_bbox(
     patch_size,
     dino_dim=384,
     vis=True,
+    input_cell=False
 ):
     # Get the coordinnates of the bouding boxe 
     bbox_row_rel, bbox_col_rel, bbox_bottom_rel, bbox_right_rel = bbox[0], bbox[1], bbox[2], bbox[3]
@@ -47,7 +49,7 @@ def extract_features_from_bbox(
         ### --- Remove restriction on fixed input image size and change pos_embed vector initialization shape ### 
         
         
-        new_num_patches_init = int(size_img_new//patch_size * size_img_new//patch_size)
+        #new_num_patches_init = int(size_img_new//patch_size * size_img_new//patch_size)
         #dino.patch_embed.strict_img_size = False
         #embed_len = new_num_patches_init
         #embed_dim = dino_dim
@@ -58,13 +60,20 @@ def extract_features_from_bbox(
         feats = dino.forward_features(input_img)
         if i == 0 :     
             print("shape des features extraites par DINO", feats.shape)
-        feats = feats[:,number_of_first_token_removed:,:]
-        num_patches = int(size_img_new//patch_size)
-        if i == 0 : 
-            print("num patches", num_patches)
-        feats = feats.reshape(
-            1, num_patches, num_patches, dino_dim
-        )
+        if model_type == "VisionTransformer" : 
+            num_patches = int(size_img_new//patch_size)
+            if i == 0 : 
+                print("num patches", num_patches)
+            num_tokens_to_remove = feats.shape[1] - (num_patches * num_patches)
+            if i == 0 : 
+                print("num_tokens_to_remove",num_tokens_to_remove)
+            feats = feats[:,num_tokens_to_remove:,:]
+            
+            feats = feats.reshape(1, num_patches, num_patches, dino_dim)
+        elif model_type == "ConvNeXt" : 
+            shape_feats = feats.shape
+            feats = feats.reshape(1, dino_dim, shape_feats[2]*shape_feats[2])
+            feats = feats.permute((0,2,1))
         if i == 0 : 
             print("shape des features reshape", feats.shape)
     features = feats.squeeze(0).cpu().numpy()  # Shape: [num_patches, num_patches, dino_dim]
@@ -73,7 +82,7 @@ def extract_features_from_bbox(
     adjusted_bbox_bottom_rel = bbox_bottom_rel - top
     adjusted_bbox_right_rel = bbox_right_rel - left
     local_bbox = (
-        adjusted_bbox_row_rel - 30, adjusted_bbox_col_rel - 30, adjusted_bbox_bottom_rel + 30, adjusted_bbox_right_rel + 30
+        adjusted_bbox_row_rel, adjusted_bbox_col_rel, adjusted_bbox_bottom_rel, adjusted_bbox_right_rel
     )
     # Create segmentation mask for the bounding box
     seg_crop = np.zeros((size_img_new, size_img_new), dtype=np.uint8)
@@ -81,17 +90,19 @@ def extract_features_from_bbox(
     
     # Downsample the segmentation to match the DINO feature map size
     seg_downsampled = cv2.resize(
-        (seg_crop * 255).astype(np.uint8), (num_patches, num_patches), interpolation=cv2.INTER_LINEAR
+        (seg_crop * 255).astype(np.uint8), (features.shape[0], features.shape[0]), interpolation=cv2.INTER_LINEAR
     )
     seg_downsampled_bool = seg_downsampled > 127  # Shape: [48, 48]
     
-    # Compute the average feature within the bounding box
-    masked_features = features[seg_downsampled_bool]
-    if masked_features.size == 0:
-        print(f"Bounding box {bbox} has zero downsampled area, returning zeros...")
-        return np.zeros(dino_dim)
-    
-    avg_feature = masked_features.mean(axis=0)
+    if not input_cell : 
+        # Compute the average feature within the bounding box
+        masked_features = features[seg_downsampled_bool]
+        if masked_features.size == 0:
+            print(f"Bounding box {bbox} has zero downsampled area, returning zeros...")
+            return np.zeros(dino_dim)
+        avg_feature = masked_features.mean(axis=0)
+    else : 
+        avg_feature = features.mean(axis=0)
     
     # Visualization
     
@@ -109,14 +120,19 @@ def extract_features_from_bbox(
             )
         )
         plt.axis("off")
-        plt.savefig("out")
+        plt.savefig("input_image")
         img_cell = img_cropped.crop((local_bbox[1], local_bbox[0], local_bbox[3], local_bbox[2]))
-        img_cell.save("out_cells.png")
+        img_cell.save("cropped_cell.png")
+        plt.close()
         plt.figure(figsize=(10, 10))
         plt.imshow(seg_downsampled_bool, cmap='gray')
         plt.title("Downsampled Segmentation Mask")
         plt.axis("off")
         plt.savefig("segmentation_mask.png")
+        plt.close()
+
+    if i ==  0 : 
+        print("shape du feature vector:", avg_feature.shape)
     return avg_feature
 
 
@@ -219,20 +235,17 @@ def load_image_of_bbox(bbox, center_crop=False):
         # We want to produce a 512x512 crop centered on the bbox center
         bbox_center_row = bbox_row_rel + bbox_height / 2
         bbox_center_col = bbox_col_rel + bbox_width / 2
-
         # Center the BBox in the crop
         # The BBox center should map to the center of the crop (256, 256)
         left = int(bbox_center_col - HALF_CROP)
         upper = int(bbox_center_row - HALF_CROP)
         right = left + CROP_SIZE
         lower = upper + CROP_SIZE
-
         # adjust the bbox coordinates according to the new cropped image 
         adjusted_bbox_row = bbox_row_rel - upper
         adjusted_bbox_col = bbox_col_rel - left
         adjusted_bbox_bottom = bbox_bottom_rel - upper
         adjusted_bbox_right = bbox_right_rel - left
-
         # Ensure we don't go outside the composite image boundaries
         if left < 0:
             right -= left
@@ -258,133 +271,45 @@ def load_image_of_bbox(bbox, center_crop=False):
             )
             cropped_image = padded
 
-        return cropped_image, [int(adjusted_bbox_row), int(adjusted_bbox_col), int(adjusted_bbox_bottom), int(adjusted_bbox_right)] 
+        return cropped_image, [int(adjusted_bbox_row), int(adjusted_bbox_col), int(adjusted_bbox_bottom), int(adjusted_bbox_right)]
     else:
         return composite_image, [bbox_row_rel, bbox_col_rel, bbox_bottom_rel, bbox_right_rel] 
 
 
-def main(dstdir, bbox_file, dino_model="vit_large_patch14_reg4_dinov2.lvd142m", device="cuda"):
+def main(bbox_file, input_size, dstdir="./features_vectors/", model_name="vit_large_patch14_clip_224", device="cuda",input_cell=False):
     """Re-run Dino on bounding boxes extracted from file and save results as .npy."""
     # 1. --- Load de DINO --- 
-    dino_models = timm.list_models('*mae*', pretrained=True)
+    dino_models = timm.list_models('*dino*', pretrained=True)
     print("liste de tous les models dino disponibles sur Timm", dino_models)
     device = torch.device(device if torch.cuda.is_available() else "cpu")
     print("Initializing Dino...")
-    # Load DINO using timm
-    
-    if dino_model == "vit_small_patch8_224.dino":
-        dino = timm.create_model("vit_small_patch8_224.dino", pretrained=True)  # Use the small variant (adjust to the appropriate DINO variant)
-        dino = dino.to(device)
-        dino = dino.eval()
-        dino_dim = 384
-        center_crop = True
-    elif dino_model == "vit_small_patch14_dinov2.lvd142m":
-        dino = timm.create_model("vit_small_patch14_dinov2.lvd142m", pretrained=True)  # Use the small variant (adjust to the appropriate DINO variant)
-        dino = dino.to(device)
-        dino = dino.eval()
-        dino_dim = 384
-        center_crop = True
-    elif dino_model == "vit_small_patch14_reg4_dinov2.lvd142m":
-        dino = timm.create_model("vit_small_patch14_reg4_dinov2.lvd142m", pretrained=True)  # Use the small variant (adjust to the appropriate DINO variant)
-        dino = dino.to(device)
-        dino = dino.eval()
-        dino_dim = 384
-        center_crop = True
-        number_of_first_token_removed = 5
-        patch_size = 14
-    elif dino_model == "vit_small_patch16_224.dino":
-        dino = timm.create_model("vit_small_patch16_224.dino", pretrained=True)  # Use the small variant (adjust to the appropriate DINO variant)
-        dino = dino.to(device)
-        dino = dino.eval()
-        dino_dim = 384
-        size_img_new = 224
-        center_crop = True
-    elif dino_model == "vit_base_patch8_224.dino" : 
-        dino = timm.create_model("vit_base_patch8_224.dino", pretrained=True)  # Use the small variant (adjust to the appropriate DINO variant)
-        dino = dino.to(device)
-        dino = dino.eval()
-        dino_dim = 768
-        size_img_new = 224
-        center_crop = True
-        number_of_first_token_removed = 1
-    elif dino_model == "vit_base_patch16_224.dino" : 
-        dino = timm.create_model("vit_base_patch16_224.dino", pretrained=True)  # Use the small variant (adjust to the appropriate DINO variant)
-        dino = dino.to(device)
-        dino = dino.eval()
-        dino_dim = 768
-        center_crop = True
-    elif dino_model == "vit_base_patch14_dinov2.lvd142m" : 
-        dino = timm.create_model("vit_base_patch14_dinov2.lvd142m", pretrained=True)  # Use the small variant (adjust to the appropriate DINO variant)
-        dino = dino.to(device)
-        dino = dino.eval()
-        dino_dim = 768
-        center_crop = True
-    elif dino_model == "vit_base_patch14_reg4_dinov2.lvd142m" : 
-        dino = timm.create_model("vit_base_patch14_reg4_dinov2.lvd142m", pretrained=True)  # Use the small variant (adjust to the appropriate DINO variant)
-        dino = dino.to(device)
-        dino = dino.eval()
-        dino_dim = 768
-        center_crop = True
-        number_of_first_token_removed = 5
-        patch_size = 14
-    elif dino_model == "vit_large_patch14_dinov2.lvd142m": 
-        dino = timm.create_model("vit_large_patch14_dinov2.lvd142m", pretrained=True)
-        dino = dino.to(device)
-        dino = dino.eval()
-        dino_dim = 1024  
-        center_crop = False
-    elif dino_model == "vit_large_patch14_reg4_dinov2.lvd142m": 
-        dino = timm.create_model("vit_large_patch14_reg4_dinov2.lvd142m", pretrained=True)
-        dino = dino.to(device)
-        dino = dino.eval()
-        dino_dim = 1024  
-        center_crop = True
-        number_of_first_token_removed = 5
-        patch_size = 14
-    elif dino_model == "vit_giant_patch14_dinov2.lvd142m" : 
-        dino = timm.create_model("vit_giant_patch14_dinov2.lvd142m", pretrained=True)
-        dino = dino.to(device)
-        dino = dino.eval()
-        dino_dim = 1536  # Change dino_dim accordingly for the big mod
-        center_crop = True
-    elif dino_model == "vit_giant_patch14_reg4_dinov2.lvd142m" : 
-        dino = timm.create_model("vit_giant_patch14_reg4_dinov2.lvd142m", pretrained=True)
-        dino = dino.to(device)
-        dino = dino.eval()
-        dino_dim = 1536  # Change dino_dim accordingly for the big mod
-        center_crop = True
-        number_of_first_token_removed = 5
-        patch_size = 14
-    elif dino_model == 'vit_base_patch16_224.mae' : 
-        dino = timm.create_model('vit_base_patch16_224.mae', pretrained=True)
-        dino = dino.to(device)
-        dino = dino.eval()
-        dino_dim = 768  # Change dino_dim accordingly for the big mod
-        center_crop = True
-        number_of_first_token_removed = 1
-        patch_size = 16
-    elif dino_model == 'vit_large_patch16_224.mae' : 
-        dino = timm.create_model('vit_base_patch16_224.mae', pretrained=True)
-        dino = dino.to(device)
-        dino = dino.eval()
-        dino_dim = 768  # Change dino_dim accordingly for the big mod
-        center_crop = True
-        number_of_first_token_removed = 1
-        patch_size = 16
-
-
-
-    else:
-        raise ValueError(f"{dino_model} not recognized, should be ['small']")
-    dino.eval()
+    # Load the model using timm
+    model = timm.create_model(model_name, pretrained=True)
+    model_type = model.__class__.__name__
+    print(f"Type d'architecture : {model_type}")
+    size_img_new = input_size
+    if model_type == "VisionTransformer" : 
+        patch_size = model.patch_embed.patch_size[0]  # 16
+        print("patch_size", patch_size)
+        num_cls_tokens = model.cls_token.shape[1] if model.cls_token is not None else 0
+        print("num_cls_tokens", num_cls_tokens)
+    else : 
+        patch_size = None
+        num_cls_tokens = None
+    center_crop = True
+    model = model.to(device)
+    model = model.eval()
+    dim_feature_vector = model.num_features
+    print("dim_feature_vector",dim_feature_vector)
     # 2. --- Image initialization ---
-    data_config = timm.data.resolve_model_data_config(dino)
-    #img_transform = timm.data.create_transform(**data_config, is_training=False)
-
-    
+    data_config = timm.data.resolve_model_data_config(model)
+    img_transform = timm.data.create_transform(**data_config, is_training=False)
+    mean = data_config['mean']
+    std = data_config['std']
+    print("Image transform implémentée de base avec le modèle : ", img_transform)
     img_transform = transforms.Compose([
         transforms.ToTensor(),
-      transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+      transforms.Normalize(mean=mean, std=std),
     ])
     print(f"transformation appliquée à l'image : {img_transform}")
     dstdir = Path(dstdir)
@@ -392,20 +317,37 @@ def main(dstdir, bbox_file, dino_model="vit_large_patch14_reg4_dinov2.lvd142m", 
     # 3. --- Extraction of features vectors --- 
     bboxes = np.load(bbox_file)
     print("Processing bounding boxes...")
+    batch_size = 32
     for i, bbox in enumerate(tqdm.tqdm(bboxes, desc="Processing bounding boxes", unit="bbox")):
         # bbox : img_number, x_min, y_min, height, width
         image, bbox_coord = load_image_of_bbox(bbox, center_crop=center_crop)
-        size_img_new = 518
-        dino.set_input_size((size_img_new, size_img_new))
+        if model_type == "VisionTransformer" : 
+            model.set_input_size((size_img_new, size_img_new))
         if i == 0 : 
             print("size_img_new", size_img_new)
-            output_file = dstdir / f"X_labeled_biggerbboxes_{dino_model}_input_size_{size_img_new}.npy"
-        feature_vector = extract_features_from_bbox(image, bbox_coord, img_transform, dino, device, size_img_new, i, number_of_first_token_removed, patch_size, dino_dim=dino_dim)
+            output_file = dstdir / f"X_{bbox_file}_{model_name}_size_{size_img_new}_dim_{dim_feature_vector}.npy"
+        feature_vector = extract_features_from_bbox(image, model_type, bbox_coord, img_transform, model, device, size_img_new, i, num_cls_tokens, patch_size, dino_dim=dim_feature_vector,input_cell=input_cell)
         # 4. --- Save the feature vectors array to the .npy file ---
         X_features.append(feature_vector)
-        X_features_np = np.array(X_features, dtype=np.float32)
-        np.save(output_file, X_features_np)
-    print(f"Feature extraction completed. Saved {X_features_np.shape[0]} feature vectors.")
+        #X_features_np = np.array(X_features, dtype=np.float32)
+        #np.save(output_file, X_features_np)
+        if (i + 1) % batch_size == 0:
+            X_features_np = np.array(X_features, dtype=np.float32)
+            if os.path.exists(output_file) : 
+                X_all_features = np.load(output_file)
+                X_all_features = np.concatenate((X_all_features,X_features_np))
+                np.save(output_file, X_all_features)
+                print(f"Batch {i+1} saved. All Features shape: {X_all_features.shape}")
+            else : 
+                np.save(output_file, X_features_np)
+                print(f"Batch {i+1} saved. All Features shape: {X_features_np.shape}")
+            X_features = []
+            X_all_features = []
+    X_features_np = np.array(X_features, dtype=np.float32)
+    X_all_features = np.load(output_file)
+    X_all_features = np.concatenate((X_all_features,X_features_np))
+    np.save(output_file, X_all_features)
+    print(f"Feature extraction completed. Saved {X_all_features.shape[0]} feature vectors.")
 
 if __name__ == "__main__":
     fire.Fire(main)

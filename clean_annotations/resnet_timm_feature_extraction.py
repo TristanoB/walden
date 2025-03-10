@@ -14,32 +14,46 @@ import h5py
 import csv
 import shutil
 import torch.nn as nn 
-import torch.nn.functional as F
-from urllib.request import urlopen
-from open_clip import create_model_from_pretrained, get_tokenizer # works on open-clip-torch >= 2.31.0, timm >= 1.0.15
-
 
 def extract_features_from_bbox(
-    image,
+    img,
     bbox,
-    preprocess,
-    model,
+    img_transform,
+    dino,
     device,
     size_img_new,
     i,
-    number_of_first_token_removed,
-    patch_size,
-    dim_features,
+    dino_dim=384,
     vis=True,
 ):
     # Get the coordinnates of the bouding boxe 
     bbox_row_rel, bbox_col_rel, bbox_bottom_rel, bbox_right_rel = bbox[0], bbox[1], bbox[2], bbox[3]
-    width, height = image.size
+    width, height = img.size
     left = (width - size_img_new) // 2
     top = (height - size_img_new) // 2
     right = left + size_img_new
     bottom = top + size_img_new
-    img_cropped = image.crop((left, top, right, bottom))  
+    img_cropped = img.crop((left, top, right, bottom))   # Maybe to remove because img_transform might contain cropping too 
+    if i == 0 : 
+        print("size de img_cropped avant transform",img_cropped.size)
+    # --- DINO inference --- 
+    with torch.no_grad():
+        input_img = img_transform(img_cropped).reshape(1, 3, size_img_new, size_img_new).to(device)
+        if i == 0 : 
+            print("size de input image", input_img.shape)
+        ### --- Compute feature map --- 
+        feats = dino.forward_features(input_img)
+        if i == 0 :     
+            print("shape des features extraites par DINO", feats.shape)
+        size_feature_map = int(np.sqrt(feats.shape[1])) # Size of the feature map extracted by the last CNN layer in the ResNet
+        if i == 0 : 
+            print("size_feature_map", size_feature_map)
+        feats = feats.reshape(
+            1, size_feature_map, size_feature_map, dino_dim
+        )
+        if i == 0 : 
+            print("shape des features reshape", feats.shape)
+    features = feats.squeeze(0).cpu().numpy()  # Shape: [num_patches, num_patches, dino_dim]
     adjusted_bbox_row_rel = bbox_row_rel - top
     adjusted_bbox_col_rel = bbox_col_rel - left
     adjusted_bbox_bottom_rel = bbox_bottom_rel - top
@@ -47,29 +61,49 @@ def extract_features_from_bbox(
     local_bbox = (
         adjusted_bbox_row_rel, adjusted_bbox_col_rel, adjusted_bbox_bottom_rel, adjusted_bbox_right_rel
     )
-    cell_image = img_cropped.crop((local_bbox[0], local_bbox[1], local_bbox[3], local_bbox[2]))
-    cell_image = cell_image.resize((size_img_new, size_img_new))
-    if i == 0 : 
-        print("size de img_cropped avant transform",img_cropped.size)
-    # --- DINO inference --- 
-    with torch.no_grad():
-        input_img = preprocess(cell_image).unsqueeze(0).to(device)
-        if i == 0 : 
-            print("size de input image", input_img.shape)
-        ### --- Compute feature map --- 
-        feats = model.encode_image(input_img, normalize=True)
-        if i == 0 :     
-            print("shape des features extraites par le modèle", feats.shape)
-    features = feats.squeeze(0).cpu().numpy()  # Shape:  [dino_dim]
-        
+    # Create segmentation mask for the bounding box
+    seg_crop = np.zeros((size_img_new, size_img_new), dtype=np.uint8)
+    seg_crop[local_bbox[0]:local_bbox[2], local_bbox[1]:local_bbox[3]] = 1
+    
+    # Downsample the segmentation to match the DINO feature map size
+    seg_downsampled = cv2.resize(
+        (seg_crop * 255).astype(np.uint8), (size_feature_map, size_feature_map), interpolation=cv2.INTER_LINEAR
+    )
+    seg_downsampled_bool = seg_downsampled > 127  # Shape: [48, 48]
+    
+    # Compute the average feature within the bounding box
+    masked_features = features[seg_downsampled_bool]
+    if masked_features.size == 0:
+        print(f"Bounding box {bbox} has zero downsampled area, returning zeros...")
+        return np.zeros(dino_dim)
+    
+    avg_feature = masked_features.mean(axis=0)
+    
+    # Visualization
     
     if vis:
         plt.figure(figsize=(10, 10))
-        plt.imshow(cell_image)
+        plt.imshow(img_cropped)
+        plt.gca().add_patch(
+            plt.Rectangle(
+                (local_bbox[1], local_bbox[0]),  # Position (x, y)
+                local_bbox[3] - local_bbox[1],  # Largeur = bbox_right - bbox_col (+10 de chaque côté)
+                local_bbox[2] - local_bbox[0],  # Hauteur = bbox_bottom - bbox_row (+10 de chaque côté)
+                edgecolor="red",
+                facecolor="none",
+                lw=2,
+            )
+        )
         plt.axis("off")
         plt.savefig("out")
-
-    return features
+        img_cell = img_cropped.crop((local_bbox[1], local_bbox[0], local_bbox[3], local_bbox[2]))
+        img_cell.save("out_cells.png")
+        plt.figure(figsize=(10, 10))
+        plt.imshow(seg_downsampled_bool, cmap='gray')
+        plt.title("Downsampled Segmentation Mask")
+        plt.axis("off")
+        plt.savefig("segmentation_mask.png")
+    return avg_feature
 
 
 
@@ -215,35 +249,33 @@ def load_image_of_bbox(bbox, center_crop=False):
         return composite_image, [bbox_row_rel, bbox_col_rel, bbox_bottom_rel, bbox_right_rel] 
 
 
-def main(dstdir, bbox_file, model_name="ViT-L-16-SigLIP2-512", device="cuda"):
+def main(bbox_file, input_size, dstdir="./features_vectors/", model_name="resmlp_24_224.fb_dino", device="cuda"):
     """Re-run Dino on bounding boxes extracted from file and save results as .npy."""
-    # 1. --- Load de DINO --- 
-    dino_models = timm.list_models('*mae*', pretrained=True)
+    # 1. --- Load du modèle --- 
+    dino_models = timm.list_models('*dino*', pretrained=True)
     print("liste de tous les models dino disponibles sur Timm", dino_models)
     device = torch.device(device if torch.cuda.is_available() else "cpu")
-    print("Initializing Dino...")
-    # Load DINO using timm
-    
-    if model_name == "ViT-L-16-SigLIP2-512":
-        model, preprocess = create_model_from_pretrained('hf-hub:timm/ViT-L-16-SigLIP2-512')
-        tokenizer = get_tokenizer('hf-hub:timm/ViT-L-16-SigLIP2-512')
-        model = model.to(device)
-        model = model.eval()
-        dim_features = 384
-        center_crop = True
-        number_of_first_token_removed = 1
-        patch_size = 16
-
-
-
-    else:
-        raise ValueError(f"{model_name} not recognized, should be ['small']")
+    print("Initializing the model...")
+    model = timm.create_model(model_name, pretrained=True)
+    print(f"Type d'architecture : {model.__class__.__name__}")
+    size_img_new = input_size
+    center_crop = True
+    model = model.to(device)
+    model = model.eval()
+    dim_feature_vector = model.num_features
+    print("dim_feature_vector",dim_feature_vector)
     model.eval()
-    # 2. --- Image initialization ---#    
+    # 2. --- Image initialization ---
+    data_config = timm.data.resolve_model_data_config(model)
+    img_transform = timm.data.create_transform(**data_config, is_training=False)
+    mean = data_config['mean']
+    std = data_config['std']
+    print("Image transform implémentée de base avec le modèle : ", img_transform)
     img_transform = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ])
+      transforms.Normalize(mean=mean, std=std),
+    ])
+    print(f"transformation appliquée à l'image : {img_transform}")
     dstdir = Path(dstdir)
     X_features = []
     # 3. --- Extraction of features vectors --- 
@@ -252,12 +284,10 @@ def main(dstdir, bbox_file, model_name="ViT-L-16-SigLIP2-512", device="cuda"):
     for i, bbox in enumerate(tqdm.tqdm(bboxes, desc="Processing bounding boxes", unit="bbox")):
         # bbox : img_number, x_min, y_min, height, width
         image, bbox_coord = load_image_of_bbox(bbox, center_crop=center_crop)
-        size_img_new = 512
-        #model.set_input_size((size_img_new, size_img_new))
         if i == 0 : 
             print("size_img_new", size_img_new)
             output_file = dstdir / f"X_labeled_{model_name}_input_size_{size_img_new}.npy"
-        feature_vector = extract_features_from_bbox(image, bbox_coord, preprocess, model, device, size_img_new, i, number_of_first_token_removed, patch_size, dim_features)
+        feature_vector = extract_features_from_bbox(image, bbox_coord, img_transform, model, device, size_img_new, i, dino_dim=dim_feature_vector)
         # 4. --- Save the feature vectors array to the .npy file ---
         X_features.append(feature_vector)
         X_features_np = np.array(X_features, dtype=np.float32)
